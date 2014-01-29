@@ -1,0 +1,336 @@
+#!/bin/bash
+
+# Script to test gluster mounts across different hosts
+#
+# Needs to be run as a user with access to all gluster directories
+# and has ssh key based auth working with other hosts in cluster
+#
+# Meant to be setup in the crontab to run at a specific interval (every 10 or 15 minutes or so) and then checked by nagios
+
+flag=$1
+
+log="/var/log/$(basename $0).log"
+lockfile="/var/run/$(basename $0).pid"
+
+error=0
+
+if [ "$flag" != "check" ]; then
+	#Clear the log
+	>$log".new"
+
+	exec 1>>$log".new"
+fi
+
+quit() {
+	if [ $1 -ne 0 ]; then
+		cat $log".new" >> $log".error"
+	fi
+
+	if [ -e $log".new" ]; then
+		mv $log".new" "$log"
+	fi
+
+	rm -f "$lockfile"
+	exit $1
+}
+
+logcheck() {
+	touch -d '-1 hour' /tmp/limit
+	if [ /tmp/limit -nt $log ] || [ ! -s $log ]; then
+	    echo "$log is stale (older than 1 hour) or is missing."
+	    quit 3
+	fi
+
+	message=$(cat "$log" | tail -1)
+
+	case "$message" in
+
+	OKAY)
+		echo $message
+		exit 0
+		;;
+	WARNING)
+		cat "$log" | grep -v "Verified" | grep -v "removed"
+		echo 1
+		;;
+	CRITICAL)
+		cat "$log" | grep -v "Verified" | grep -v "removed"
+		exit 2
+		;;
+	*)
+		cat "$log" | grep -v "Verified" | grep -v "removed"
+		echo "ERROR: Could not find error code!"
+		exit 3
+		;;
+	esac
+
+}
+
+checkgluster() {
+	while read mline; do
+
+		# Cut up the mount line to make only choose gluster volumes
+		type=$(echo $mline | awk '{print $3}' | cut -d "#" -f1)
+
+		if [ "$type" == "fuse.glusterfs" ]; then
+			volume=$(echo $mline | awk '{print $1}' | cut -d ":" -f 2 | sed 's|^/||g')
+
+			# Run "gluster volume info" to verify the volume name is correct
+			if [ `/usr/sbin/gluster volume info $volume >/dev/null 2>&1` ]; then
+				echo "Unable to determine volume "
+				error=2
+				continue
+			fi
+
+			# Get the local Mount point
+			mount=$(echo $mline | awk '{print $2}')
+			if [ ! -d $mount ]; then
+				echo "Mount $mount is not a directory. "
+				error=2
+				continue
+			fi
+
+                        IFSBAK="$IFS"
+
+                        IFS="|"
+
+			# Find a list of all directories under mount point
+			DIRS=`find $mount -maxdepth 3 ! -name "*.*" -type d -exec echo -n {}'|' \; | sed 's/|$//g' | sed "s|$mount||g"`
+
+
+			# Do some magic and find a random directory to test
+			RAND=$(cat /proc/sys/kernel/random/uuid | cut -c1-4 | od -d | head -1 | cut -d' ' -f2)
+
+			LINES=0
+			for line in "$DIRS"; do
+				(( LINES++ ))
+			done
+
+			if [ $LINES -lt 1 ]; then
+				echo "Unable to locate any directories in $DIRS"
+				continue
+			fi
+
+			LINE=`expr $RAND % $LINES + 1`
+
+			#echo "Random Line: $LINE"
+
+			i=1
+			for dir in $DIRS; do
+				if [ "$i" == "$LINE" ]; then
+					rdir="$dir/glustercheck"
+					break
+				fi
+
+				(( i++ ))
+			done
+
+		        IFS="$IFSBAK"
+
+			if [ "$rdir" == "" ]; then
+				echo "Unable to find a random directory"
+				continue
+			fi
+
+			mkdir -p "$mount$rdir"
+			chmod 777 "$mount$rdir"
+
+			if [ -e "$mount$rdir" ]; then
+				TMPFILE="$(mktemp -p "$mount$rdir")" || quit 1
+				TMPPATH="$(echo "$TMPFILE" | sed "s|$mount||g")"
+			else
+				echo "Cannot find the directory "$mount$rdir" that we just created"
+				quit 2
+			fi
+
+			# Write some random data to the temp file
+			if [ -f "$TMPFILE" ]; then
+				#dd if="/dev/zero" of="$TMPFILE" bs=200k count=1 >/dev/null 2>&1
+				uuidgen > "$TMPFILE" 2>&1
+				chmod 777 "$TMPFILE"
+				sleep 1
+				sync
+			else
+				echo "$TMPFILE doesn't exist. Something is wrong"
+				quit 2
+			fi
+
+			# Get the md5sum of the file
+			localmd5="$(md5sum "$TMPFILE")"
+
+			continue=1
+			errorcount=0
+
+			while [ $continue -ne 0 ]; do
+			# Loop through all of the other hosts to verify the file was written
+			for host in $(/usr/sbin/gluster volume info $volume | egrep '^Brick[0-9]+' | cut -d ":" -f 2 | sed "s/^ //g"); do
+				if [ "$(hostname)" == "$host" ] || [ "$(hostname -s)" == "$host" ]; then
+					echo -n ""
+				else
+                                        rmd5="$(ssh sshuser@$host tmppath="\"$TMPPATH\"" volume="$volume" 'bash -s' <<'ENDSSH'
+							mpoint=$(grep "$volume" /etc/mtab | awk '{print $2}' 2>/dev/null)
+							if [ -d "$mpoint" ] && [ "$mpoint" != "" ]; then
+								md5sum "$mpoint${tmppath}"
+							else
+								echo "No Mount"
+							fi
+							exit 0
+ENDSSH
+)"
+					if [ "$?" != 0 ]; then
+						echo "Unable to ssh to $host or problem with remote ssh command"
+						#quit 1
+					fi
+
+					#echo "Remote output: $rmd5"
+					if [ "$rmd5" == "No Mount" ]; then
+						echo "Volume $volume not mounted on remote host $host"
+						continue=0
+					else
+						if [ "$(echo $localmd5 | awk '{print $1}')" == "$(echo $rmd5 | awk '{print $1}')" ]; then
+							echo "Verified $volume on $(hostname) syncs with $host. "
+							continue=0
+						else
+							echo "Error, md5 on file in $TMPPATH in $volume on $(hostname) $(echo $localmd5 | awk '{print $1}') differed with $host $(echo $rmd5 | awk '{print $1}'). "
+							echo -n "Local File: "
+							ls -lah  "$TMPFILE"
+							cat "$TMPFILE"
+
+							rfile=$(ssh sshuser@$host tmppath="\"$TMPPATH\"" volume="$volume" 'bash -s' <<'ENDSSH'
+                                                        mpoint=$(grep "$volume" /etc/mtab | awk '{print $2}' 2>/dev/null)
+                                                        if [ -d $mpoint ] && [ "$mpoint" != "" ]; then 
+                                                                ls -lah ""$mpoint${tmppath}""
+								cat "$mpoint$tmppath"
+                                                        else
+                                                                echo "No Mount"
+                                                        fi
+                                                        exit 0
+ENDSSH
+)
+
+                                                        echo "Remote File: $rfile "
+
+							if [ $errorcount -gt 1 ]; then
+								error=2
+								continue=0
+							else
+								errorcount=$(( $errorcount + 1 ))
+								sleep 10
+							fi
+						fi
+					fi
+				fi
+			done
+			done
+
+			if [ -f "$TMPFILE" ]; then
+				if [ $error -ne 0 ]; then
+					echo "Not removing file, please check"
+				else
+					rm -f "$TMPFILE"
+					# Do some grep magic and make sure the folder we're deleting is a subfolder and called glustercheck
+					if `echo "$mount$rdir" | egrep -q "\/.*\/glustercheck$"`; then
+						rmdir="$mount$rdir|$rmdir"
+					else
+						echo "I'm not sure it's safe to delete "$mount$rdir""
+						quit 2
+					fi
+				fi
+			else
+				echo "$TMPFILE doesn't exist locally. Something is wrong"
+				quit 2
+			fi
+
+			sleep 2
+
+			if [ $error -eq 0 ]; then
+				for host in $(/usr/sbin/gluster volume info $volume | egrep '^Brick[0-9]+' | cut -d ":" -f 2 | sed "s/^ //g"); do
+					if [ "$(hostname)" == "$host" ] || [ "$(hostname -s)" == "$host" ]; then
+						echo -n ""
+					else
+						rout=$(ssh sshuser@$host tmppath="\"$TMPPATH\"" volume="$volume" 'bash -s' <<'ENDSSH'
+								mpoint=$(grep "$volume" /etc/mtab | awk '{print $2}')
+								if [ -e "$mpoint$tmppath" ]; then
+									if [ -f "$mpoint$tmppath" ]; then
+										rm -f "$mpoint$tmppath"
+									fi
+									echo "$mpoint$tmppath"
+								else
+									echo "Okay"
+								fi
+								exit 0
+ENDSSH
+)
+
+						if [ "$rout" == "Okay" ]; then
+							echo -n ""
+						else
+							echo "Error, $rout was not automatically removed on $host' and was removed manually."
+							error=2
+						fi
+
+					fi
+				done
+			fi
+
+		fi
+
+	done < /etc/mtab
+
+	IFSBAK="$IFS"
+
+	IFS="|"
+
+	for ddir in "$rmdir"; do
+                # Do some grep magic and make sure the folder we're deleting is a subfolder and called glustercheck
+                if `echo $ddir | egrep -q "\/.*\/glustercheck$"`; then
+                	rm -rvf --preserve-root -- "$ddir"
+		else
+                        echo "I'm not sure it's safe to delete \"$mount$rdir\""
+	                error=2
+                fi
+	done
+
+	IFS="$IFSBAK"
+
+	case "$error" in
+
+	0)
+		echo "OKAY"
+		;;
+	1)
+		echo "WARNING"
+		cat $log".new" >> $log".error"
+		;;
+	2)
+		echo "CRITICAL"
+		cat $log".new" >> $log".error"
+		;;
+	*)
+		echo "Unknown Error."
+		cat $log".new" >> $log".error"
+		echo "CRITICAL"
+		;;
+	esac
+
+}
+
+if [ "$flag" == "check" ]; then
+	logcheck
+else
+	if [ -e $lockfile ]; then
+		if [ `ps axu | grep $(cat $lockfile) | grep -v grep | wc -l` -eq 0 ]; then
+			echo "$(basename $0) is running, but can't find pid $(cat $lockfile)" >&2
+			quit 1
+		else
+			echo "$(basename $0) is running" >&2
+			exit 1
+		fi
+	else
+		echo "$$" > $lockfile
+	fi
+
+	checkgluster
+fi
+
+quit $error

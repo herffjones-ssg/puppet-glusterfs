@@ -15,6 +15,9 @@
 #  }
 #
 class glusterfs::server (
+  $notification_period = "24x7",
+  $notification_interval = "30",
+  $contact_groups = "indyweb",
   $peers = []
 ) {
 
@@ -30,5 +33,29 @@ class glusterfs::server (
   # Peers
   glusterfs::peer { $peers: }
 
-}
+  file { '/usr/local/bin/gluster_check':
+    source => 'puppet:///modules/glusterfs/gluster_check',
+    owner  => 'root',
+    group  => 'root',
+    mode   => '0750',
+  }
 
+  cron { 'gluster_check_script':
+    command => '/usr/local/bin/gluster_check 2>/dev/null',
+    user    => 'root',
+    minute  => '*/15',
+  }
+
+  @@nagios_service { "gluster_check_${::hostname}":
+    ensure                => present,
+    use                   => "generic-service",
+    service_description   => "gluster_check",
+    host_name             => $::hostname,
+    notification_period   => $notification_period,
+    notification_interval => $notification_interval,
+    check_command         => "gluster_check",
+    contact_groups        => $contact_groups,
+    target                => "/etc/nagios/services/${::fqdn}.cfg",
+  }
+
+}

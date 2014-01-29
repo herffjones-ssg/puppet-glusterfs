@@ -4,7 +4,9 @@
 # Use the $peers option to the glusterfs::server class instead of this
 # definition directly.
 #
-define glusterfs::peer () {
+define glusterfs::peer (
+  $enable = "",
+) {
 
   exec { "/usr/sbin/gluster peer probe ${title}":
     unless  => "/bin/egrep '^hostname.+=${title}$' /var/lib/glusterd/peers/*",
